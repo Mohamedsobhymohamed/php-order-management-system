@@ -2,7 +2,7 @@
 
 ## 📚 Project Overview
 
-A complete online bookstore management system built for Alexandria University - Database Systems Project (Fall 2025).
+A complete online bookstore management system.
 
 ### Features
 
@@ -182,6 +182,5 @@ order_management_system/
 
 4. **Reports:** All reports use stored procedures for efficient data retrieval.
 
----
 
-© 2025 Alexandria University - Database Systems Project
+
