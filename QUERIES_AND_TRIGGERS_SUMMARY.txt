@@ -1,0 +1,741 @@
+================================================================================
+BOOKSTORE PROJECT - QUERIES & TRIGGERS QUICK REFERENCE
+================================================================================
+
+================================================================================
+QUERIES BY FILE
+================================================================================
+
+--------------------------------------------------------------------------------
+1. config/database.php
+--------------------------------------------------------------------------------
+NO QUERIES - Only connection management
+
+
+--------------------------------------------------------------------------------
+2. index.php (Homepage)
+--------------------------------------------------------------------------------
+QUERY 1: Get filtered books
+SELECT * FROM vw_books_full_details 
+WHERE 1=1
+[+ AND (title LIKE ? OR isbn LIKE ?)]
+[+ AND category = ?]
+[+ AND authors LIKE ?]
+ORDER BY title
+
+QUERY 2: Get cart count
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+
+
+--------------------------------------------------------------------------------
+3. login.php (Customer Login)
+--------------------------------------------------------------------------------
+QUERY 1: Verify credentials
+SELECT customer_id, username, password_hash, first_name, last_name 
+FROM customers 
+WHERE username = ?
+
+QUERY 2: Update last login
+UPDATE customers 
+SET last_login = NOW() 
+WHERE customer_id = ?
+
+
+--------------------------------------------------------------------------------
+4. register.php (Customer Registration)
+--------------------------------------------------------------------------------
+[TRANSACTION START]
+
+QUERY 1: Check username/email exists
+SELECT customer_id 
+FROM customers 
+WHERE username = ? OR email = ?
+
+QUERY 2: Insert customer
+INSERT INTO customers (username, password_hash, first_name, last_name, email)
+VALUES (?, ?, ?, ?, ?)
+
+QUERY 3: Insert phone
+INSERT INTO customer_phones (customer_id, phone_number, phone_type, is_primary)
+VALUES (?, ?, ?, TRUE)
+
+QUERY 4: Insert address
+INSERT INTO customer_addresses 
+    (customer_id, address_line1, address_line2, city, state, country, 
+     postal_code, address_type, is_default)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+
+QUERY 5: Create cart
+INSERT INTO shopping_cart (customer_id) VALUES (?)
+
+[TRANSACTION COMMIT]
+
+
+--------------------------------------------------------------------------------
+5. cart.php (View Cart Page)
+--------------------------------------------------------------------------------
+QUERY 1: Get or create cart
+SELECT cart_id FROM shopping_cart WHERE customer_id = ?
+-- If not exists: INSERT INTO shopping_cart (customer_id) VALUES (?)
+
+QUERY 2: Get cart items with details
+SELECT 
+    sci.cart_item_id, sci.isbn, sci.quantity, 
+    b.title, b.selling_price, b.quantity_in_stock, b.image_url,
+    GROUP_CONCAT(a.author_name ORDER BY a.author_name SEPARATOR ', ') as authors
+FROM shopping_cart_items sci
+JOIN books b ON sci.isbn = b.isbn
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+WHERE sci.cart_id = ?
+GROUP BY sci.cart_item_id
+
+QUERY 3: Get cart count
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+
+
+--------------------------------------------------------------------------------
+6. api/cart.php (Cart API)
+--------------------------------------------------------------------------------
+ACTION: add
+--------
+QUERY 1: Get/create cart
+SELECT cart_id FROM shopping_cart WHERE customer_id = ?
+
+QUERY 2: Check book stock
+SELECT title, quantity_in_stock FROM books WHERE isbn = ?
+
+QUERY 3: Check existing cart item
+SELECT quantity FROM shopping_cart_items WHERE cart_id = ? AND isbn = ?
+
+QUERY 4a: Update existing item
+UPDATE shopping_cart_items SET quantity = ? WHERE cart_id = ? AND isbn = ?
+
+QUERY 4b: Insert new item
+INSERT INTO shopping_cart_items (cart_id, isbn, quantity) VALUES (?, ?, ?)
+
+QUERY 5: Get cart count
+SELECT SUM(quantity) as total FROM shopping_cart_items WHERE cart_id = ?
+
+ACTION: update
+--------
+QUERY 1: Get cart_id
+QUERY 2: Check stock
+SELECT quantity_in_stock FROM books WHERE isbn = ?
+
+QUERY 3: Update quantity
+UPDATE shopping_cart_items SET quantity = ? WHERE cart_id = ? AND isbn = ?
+
+QUERY 4: Get totals (2 queries)
+SELECT SUM(quantity) as count FROM shopping_cart_items WHERE cart_id = ?
+SELECT SUM(b.selling_price * sci.quantity) as total 
+FROM shopping_cart_items sci 
+JOIN books b ON sci.isbn = b.isbn 
+WHERE sci.cart_id = ?
+
+ACTION: remove
+--------
+QUERY 1: Delete item
+DELETE FROM shopping_cart_items WHERE cart_id = ? AND isbn = ?
+
+QUERY 2: Get totals (same 2 queries as update)
+
+ACTION: get_count
+--------
+QUERY: Get count
+SELECT SUM(quantity) as count FROM shopping_cart_items WHERE cart_id = ?
+
+ACTION: get_total
+--------
+QUERY: Get count and total (same 2 queries as update)
+
+
+--------------------------------------------------------------------------------
+7. checkout.php (Order Processing)
+--------------------------------------------------------------------------------
+[READ QUERIES]
+QUERY 1: Get cart_id
+SELECT cart_id FROM shopping_cart WHERE customer_id = ?
+
+QUERY 2: Get cart items
+SELECT sci.isbn, sci.quantity, b.title, b.selling_price, b.quantity_in_stock
+FROM shopping_cart_items sci
+JOIN books b ON sci.isbn = b.isbn
+WHERE sci.cart_id = ?
+
+QUERY 3: Get saved payment methods
+SELECT * FROM payment_methods 
+WHERE customer_id = ? 
+ORDER BY is_default DESC, created_at DESC
+
+QUERY 4: Get saved addresses
+SELECT * FROM customer_addresses 
+WHERE customer_id = ? 
+ORDER BY is_default DESC
+
+[TRANSACTION START]
+
+QUERY 5: Verify payment ownership
+SELECT payment_id FROM payment_methods 
+WHERE payment_id = ? AND customer_id = ?
+
+QUERY 6: Insert payment (if new)
+INSERT INTO payment_methods 
+    (customer_id, card_number, card_holder_name, expiry_date, card_type, is_default)
+VALUES (?, ?, ?, ?, ?, ?)
+
+QUERY 7: Verify address ownership
+SELECT address_id FROM customer_addresses 
+WHERE address_id = ? AND customer_id = ?
+
+QUERY 8: Check stock with lock (for each item)
+SELECT quantity_in_stock FROM books WHERE isbn = ? FOR UPDATE
+
+QUERY 9: Create order
+INSERT INTO customer_orders 
+    (customer_id, payment_id, shipping_address_id, total_amount, order_status)
+VALUES (?, ?, ?, ?, 'Completed')
+
+QUERY 10: Insert order items (loops for each item - TRIGGERS FIRE)
+INSERT INTO order_items (order_id, isbn, quantity, unit_price)
+VALUES (?, ?, ?, ?)
+
+QUERY 11: Clear cart
+DELETE FROM shopping_cart_items WHERE cart_id = ?
+
+[TRANSACTION COMMIT]
+
+
+--------------------------------------------------------------------------------
+8. orders.php (Order History)
+--------------------------------------------------------------------------------
+QUERY 1: Get orders with address
+SELECT 
+    co.order_id, co.order_date, co.total_amount, co.order_status,
+    ca.address_line1, ca.city, ca.country
+FROM customer_orders co
+LEFT JOIN customer_addresses ca ON co.shipping_address_id = ca.address_id
+WHERE co.customer_id = ?
+ORDER BY co.order_date DESC
+
+QUERY 2: Get order items (loops for each order)
+SELECT oi.isbn, oi.quantity, oi.unit_price, oi.subtotal, b.title
+FROM order_items oi
+JOIN books b ON oi.isbn = b.isbn
+WHERE oi.order_id = ?
+
+QUERY 3: Get cart count
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+
+
+--------------------------------------------------------------------------------
+9. logout.php (Logout)
+--------------------------------------------------------------------------------
+QUERY 1: Get cart_id
+SELECT cart_id FROM shopping_cart WHERE customer_id = ?
+
+QUERY 2: Clear cart items
+DELETE FROM shopping_cart_items WHERE cart_id = ?
+
+
+--------------------------------------------------------------------------------
+10. profile.php (Customer Profile)
+--------------------------------------------------------------------------------
+[READ QUERIES - PAGE LOAD]
+QUERY 1: Get customer info
+SELECT * FROM customers WHERE customer_id = ?
+
+QUERY 2: Get phones
+SELECT * FROM customer_phones WHERE customer_id = ? ORDER BY is_primary DESC
+
+QUERY 3: Get addresses
+SELECT * FROM customer_addresses WHERE customer_id = ? ORDER BY is_default DESC
+
+QUERY 4: Get payment methods
+SELECT * FROM payment_methods WHERE customer_id = ? ORDER BY is_default DESC
+
+QUERY 5: Get cart count
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+
+[WRITE QUERIES - BY ACTION]
+
+ACTION: update_profile
+UPDATE customers SET first_name = ?, last_name = ?, email = ? 
+WHERE customer_id = ?
+
+ACTION: change_password
+SELECT password_hash FROM customers WHERE customer_id = ?
+UPDATE customers SET password_hash = ? WHERE customer_id = ?
+
+ACTION: add_phone
+INSERT INTO customer_phones (customer_id, phone_number, phone_type) 
+VALUES (?, ?, ?)
+
+ACTION: delete_phone
+DELETE FROM customer_phones WHERE phone_id = ? AND customer_id = ?
+
+ACTION: set_primary_phone
+UPDATE customer_phones SET is_primary = 0 WHERE customer_id = ?
+UPDATE customer_phones SET is_primary = 1 WHERE phone_id = ? AND customer_id = ?
+
+ACTION: add_address
+INSERT INTO customer_addresses 
+    (customer_id, address_line1, address_line2, city, state, 
+     country, postal_code, address_type) 
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+
+ACTION: delete_address
+DELETE FROM customer_addresses WHERE address_id = ? AND customer_id = ?
+
+ACTION: set_default_address
+UPDATE customer_addresses SET is_default = 0 WHERE customer_id = ?
+UPDATE customer_addresses SET is_default = 1 WHERE address_id = ? AND customer_id = ?
+
+ACTION: delete_payment
+DELETE FROM payment_methods WHERE payment_id = ? AND customer_id = ?
+
+ACTION: set_default_payment
+UPDATE payment_methods SET is_default = 0 WHERE customer_id = ?
+UPDATE payment_methods SET is_default = 1 WHERE payment_id = ? AND customer_id = ?
+
+
+--------------------------------------------------------------------------------
+11. admin/login.php (Admin Login)
+--------------------------------------------------------------------------------
+QUERY 1: Verify credentials
+SELECT admin_id, username, first_name, last_name 
+FROM administrators 
+WHERE username = ?
+
+QUERY 2: Update last login
+UPDATE administrators SET last_login = NOW() WHERE admin_id = ?
+
+
+--------------------------------------------------------------------------------
+12. admin/dashboard.php (Admin Dashboard)
+--------------------------------------------------------------------------------
+QUERY 1: Total books
+SELECT COUNT(*) as count FROM books
+
+QUERY 2: Total customers
+SELECT COUNT(*) as count FROM customers
+
+QUERY 3: Total orders
+SELECT COUNT(*) as count FROM customer_orders
+
+QUERY 4: Total revenue
+SELECT COALESCE(SUM(total_amount), 0) as total 
+FROM customer_orders 
+WHERE order_status = 'Completed'
+
+QUERY 5: Today's orders
+SELECT COUNT(*) as count FROM customer_orders 
+WHERE DATE(order_date) = CURDATE()
+
+QUERY 6: Pending publisher orders
+SELECT COUNT(*) as count FROM publisher_orders 
+WHERE order_status = 'Pending'
+
+QUERY 7: Low stock books
+SELECT COUNT(*) as count FROM books 
+WHERE quantity_in_stock < minimum_threshold
+
+QUERY 8: Recent orders
+SELECT co.order_id, co.order_date, co.total_amount, co.order_status,
+       CONCAT(c.first_name, ' ', c.last_name) as customer_name
+FROM customer_orders co
+JOIN customers c ON co.customer_id = c.customer_id
+ORDER BY co.order_date DESC LIMIT 5
+
+QUERY 9: Low stock list
+SELECT * FROM vw_low_stock_books LIMIT 5
+
+
+--------------------------------------------------------------------------------
+13. admin/books.php (Book Management)
+--------------------------------------------------------------------------------
+[READ QUERIES - PAGE LOAD]
+QUERY 1: Get all books with authors
+SELECT b.*, p.publisher_name,
+       GROUP_CONCAT(a.author_id) as author_ids,
+       GROUP_CONCAT(a.author_name ORDER BY a.author_name SEPARATOR ', ') as authors
+FROM books b
+LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+GROUP BY b.isbn
+ORDER BY b.title
+
+QUERY 2: Get authors
+SELECT * FROM authors ORDER BY author_name
+
+QUERY 3: Get publishers
+SELECT * FROM publishers ORDER BY publisher_name
+
+[WRITE QUERIES - BY ACTION]
+
+ACTION: add (Add Book)
+[TRANSACTION START]
+QUERY 1: Check ISBN exists
+SELECT isbn FROM books WHERE isbn = ?
+
+QUERY 2: Insert book
+INSERT INTO books 
+    (isbn, title, publisher_id, publication_year, selling_price, 
+     category, image_url, quantity_in_stock, minimum_threshold)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+QUERY 3: Check author exists (loops for each author)
+SELECT author_id FROM authors WHERE author_name = ?
+
+QUERY 4: Insert author (if new)
+INSERT INTO authors (author_name) VALUES (?)
+
+QUERY 5: Link book-author
+INSERT INTO book_authors (isbn, author_id) VALUES (?, ?)
+
+[TRANSACTION COMMIT]
+
+ACTION: edit (Edit Book)
+[TRANSACTION START]
+QUERY 1: Update book
+UPDATE books 
+SET title = ?, publisher_id = ?, publication_year = ?, 
+    selling_price = ?, category = ?, quantity_in_stock = ?, 
+    minimum_threshold = ?
+WHERE isbn = ?
+
+QUERY 2: Delete author links
+DELETE FROM book_authors WHERE isbn = ?
+
+QUERY 3-5: Same as add (check/create authors, link)
+
+[TRANSACTION COMMIT]
+
+ACTION: delete (Delete Book)
+QUERY 1: Check if book has orders
+SELECT COUNT(*) as count FROM order_items WHERE isbn = ?
+
+QUERY 2: Delete from cart
+DELETE FROM shopping_cart_items WHERE isbn = ?
+
+QUERY 3: Delete publisher orders
+DELETE FROM publisher_orders WHERE isbn = ?
+
+QUERY 4: Delete author links
+DELETE FROM book_authors WHERE isbn = ?
+
+QUERY 5: Delete book
+DELETE FROM books WHERE isbn = ?
+
+ACTION: update_stock (Quick Stock Update)
+UPDATE books SET quantity_in_stock = ? WHERE isbn = ?
+
+
+--------------------------------------------------------------------------------
+14. admin/orders.php (Order Management)
+--------------------------------------------------------------------------------
+[READ QUERIES]
+QUERY 1: Pending publisher orders
+SELECT po.*, b.title, p.publisher_name
+FROM publisher_orders po
+JOIN books b ON po.isbn = b.isbn
+JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE po.order_status = 'Pending'
+ORDER BY po.order_date DESC
+
+QUERY 2: Confirmed publisher orders
+SELECT po.*, b.title, p.publisher_name
+FROM publisher_orders po
+JOIN books b ON po.isbn = b.isbn
+JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE po.order_status = 'Confirmed'
+ORDER BY po.confirmed_date DESC LIMIT 10
+
+QUERY 3: Customer orders
+SELECT co.*, CONCAT(c.first_name, ' ', c.last_name) as customer_name,
+       c.email, COUNT(oi.order_item_id) as item_count
+FROM customer_orders co
+JOIN customers c ON co.customer_id = c.customer_id
+LEFT JOIN order_items oi ON co.order_id = oi.order_id
+GROUP BY co.order_id
+ORDER BY co.order_date DESC LIMIT 20
+
+[WRITE QUERIES - BY ACTION]
+
+ACTION: confirm_order (TRIGGER FIRES!)
+UPDATE publisher_orders 
+SET order_status = 'Confirmed', confirmed_date = NOW() 
+WHERE order_id = ?
+
+ACTION: cancel_order
+UPDATE publisher_orders SET order_status = 'Cancelled' WHERE order_id = ?
+
+
+--------------------------------------------------------------------------------
+15. admin/reports.php (Business Reports)
+--------------------------------------------------------------------------------
+All reports use STORED PROCEDURES:
+
+REPORT: previous_month
+CALL get_sales_previous_month()
+
+REPORT: specific_date
+CALL get_sales_for_date(?)
+
+REPORT: top_customers
+CALL get_top_customers(3)
+
+REPORT: top_books
+CALL get_top_selling_books(3)
+
+REPORT: book_orders
+CALL get_book_order_count(?)
+
+
+--------------------------------------------------------------------------------
+16. admin/logout.php
+--------------------------------------------------------------------------------
+NO QUERIES - Only session destruction
+
+
+================================================================================
+TRIGGERS (5 TOTAL)
+================================================================================
+
+--------------------------------------------------------------------------------
+TRIGGER 1: trg_before_book_update
+--------------------------------------------------------------------------------
+EVENT: BEFORE UPDATE on books
+PURPOSE: Prevent negative stock
+BUSINESS RULE: Stock cannot be negative
+
+CREATE TRIGGER trg_before_book_update
+BEFORE UPDATE ON books
+FOR EACH ROW
+BEGIN
+    IF NEW.quantity_in_stock < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Stock cannot be negative';
+    END IF;
+END;
+
+FIRES WHEN: Any UPDATE on books that would set quantity_in_stock < 0
+EFFECT: Blocks the update, throws error
+
+
+--------------------------------------------------------------------------------
+TRIGGER 2: trg_after_book_update_reorder
+--------------------------------------------------------------------------------
+EVENT: AFTER UPDATE on books
+PURPOSE: Automatic reorder when stock drops below threshold
+BUSINESS RULE: Auto-order 50 units when crossing threshold
+
+CREATE TRIGGER trg_after_book_update_reorder
+AFTER UPDATE ON books
+FOR EACH ROW
+BEGIN
+    IF OLD.quantity_in_stock >= OLD.minimum_threshold   -- TO PREVENT MULTIPLE ORDERS
+       AND NEW.quantity_in_stock < NEW.minimum_threshold THEN
+        INSERT INTO publisher_orders (isbn, quantity_ordered, order_status)
+        VALUES (NEW.isbn, 50, 'Pending');
+    END IF;
+END;
+
+FIRES WHEN: Stock updates from above threshold to below threshold
+EFFECT: Creates publisher order for 50 units
+USED IN: checkout.php (when stock decrements), admin stock updates
+
+
+--------------------------------------------------------------------------------
+TRIGGER 3: trg_before_order_item_insert
+--------------------------------------------------------------------------------
+EVENT: BEFORE INSERT on order_items
+PURPOSE: Calculate subtotal automatically
+BUSINESS RULE: Subtotal = quantity × unit_price
+
+CREATE TRIGGER trg_before_order_item_insert
+BEFORE INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    IF NEW.subtotal IS NULL THEN
+        SET NEW.subtotal = NEW.quantity * NEW.unit_price;
+    END IF;
+END;
+
+FIRES WHEN: checkout.php inserts order items
+EFFECT: Automatically calculates subtotal field
+
+
+--------------------------------------------------------------------------------
+TRIGGER 4: trg_after_order_item_insert
+--------------------------------------------------------------------------------
+EVENT: AFTER INSERT on order_items
+PURPOSE: Decrement stock when item sold
+BUSINESS RULE: Stock decreases on sale
+
+CREATE TRIGGER trg_after_order_item_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    UPDATE books 
+    SET quantity_in_stock = quantity_in_stock - NEW.quantity
+    WHERE isbn = NEW.isbn;
+END;
+
+FIRES WHEN: checkout.php inserts order items
+EFFECT: Decrements book stock
+CHAIN REACTION: May trigger trg_after_book_update_reorder if stock goes low
+
+
+--------------------------------------------------------------------------------
+TRIGGER 5: trg_after_publisher_order_confirm
+--------------------------------------------------------------------------------
+EVENT: AFTER UPDATE on publisher_orders
+PURPOSE: Add stock when publisher order confirmed
+BUSINESS RULE: Stock increases on replenishment
+
+CREATE TRIGGER trg_after_publisher_order_confirm
+AFTER UPDATE ON publisher_orders
+FOR EACH ROW
+BEGIN
+    IF OLD.order_status = 'Pending' AND NEW.order_status = 'Confirmed' THEN
+        UPDATE books 
+        SET quantity_in_stock = quantity_in_stock + NEW.quantity_ordered
+        WHERE isbn = NEW.isbn;
+    END IF;
+END;
+
+FIRES WHEN: admin/orders.php confirms publisher order
+EFFECT: Increases book stock by quantity_ordered
+CONDITION: Only when status changes from Pending to Confirmed
+
+
+================================================================================
+TRIGGER CHAIN EXAMPLE
+================================================================================
+
+Customer places order for 15 books (stock was 20, threshold 10):
+
+1. checkout.php: INSERT INTO order_items (15 units)
+2. TRIGGER 3 fires: Calculates subtotal
+3. TRIGGER 4 fires: UPDATE books SET stock = 20 - 15 = 5
+4. TRIGGER 2 fires: Stock 5 < threshold 10, creates publisher order
+5. Result: Stock = 5, Publisher order created automatically
+
+Admin confirms publisher order (50 units):
+
+1. admin/orders.php: UPDATE publisher_orders SET status = 'Confirmed'
+2. TRIGGER 5 fires: UPDATE books SET stock = 5 + 50 = 55
+3. Result: Stock = 55
+
+
+================================================================================
+STORED PROCEDURES (5 TOTAL)
+================================================================================
+
+1. get_sales_previous_month()
+   - No parameters
+   - Returns: sale_date, total_orders, total_sales
+   - Groups by date for last month
+
+2. get_sales_for_date(p_date DATE)
+   - Parameter: date
+   - Returns: title, copies_sold, total_revenue
+   - Sales breakdown for specific date
+
+3. get_top_customers(p_months INT)
+   - Parameter: number of months
+   - Returns: customer_id, customer_name, email, total_orders, total_spent
+   - Top 5 customers by spending
+
+4. get_top_selling_books(p_months INT)
+   - Parameter: number of months
+   - Returns: isbn, title, authors, copies_sold, total_revenue
+   - Top 10 books by copies sold
+
+5. get_book_order_count(p_isbn VARCHAR(13))
+   - Parameter: ISBN
+   - Returns: isbn, title, times_ordered, total_quantity_ordered
+   - Publisher order frequency for specific book
+
+
+================================================================================
+VIEWS (3 TOTAL)
+================================================================================
+
+1. vw_books_full_details
+   - Pre-joined: books + authors + publishers
+   - Uses: GROUP_CONCAT for multiple authors
+   - Used in: index.php, admin/books.php
+
+2. vw_customer_order_history
+   - Pre-joined: orders + customers + order_items + books + addresses
+   - One row per order item
+   - Used in: orders.php (optional)
+
+3. vw_low_stock_books
+   - Filters: quantity_in_stock < minimum_threshold
+   - Calculated: reorder_quantity
+   - Used in: admin/dashboard.php
+
+
+================================================================================
+QUERY COUNT SUMMARY
+================================================================================
+
+CUSTOMER PAGES:
+- index.php: 2 queries
+- login.php: 2 queries
+- register.php: 5 queries (transaction)
+- cart.php: 3 queries (read only)
+- checkout.php: 11+ queries (transaction with loops)
+- orders.php: 2 + N queries (N = order count)
+- logout.php: 2 queries
+- profile.php: 5 reads + 1-4 per action
+
+API:
+- api/cart.php: 3-6 queries per action
+
+ADMIN PAGES:
+- admin/login.php: 2 queries
+- admin/dashboard.php: 9 queries
+- admin/books.php: 3 reads + 5-10 per action (transaction)
+- admin/orders.php: 3 reads + 1 per action (triggers fire!)
+- admin/reports.php: 1 stored procedure call per report
+
+TOTAL UNIQUE QUERIES: ~80
+
+================================================================================
+KEY DIFFERENCES: cart.php vs api/cart.php
+================================================================================
+
+cart.php:
+- PURPOSE: Display cart (VIEW layer)
+- QUERIES: Read only (SELECT)
+- OUTPUT: HTML page
+- COMPLEXITY: Complex JOIN with GROUP_CONCAT for authors
+
+api/cart.php:
+- PURPOSE: Modify cart (CONTROLLER layer)
+- QUERIES: Write operations (INSERT, UPDATE, DELETE)
+- OUTPUT: JSON responses
+- COMPLEXITY: Business logic (stock validation, quantity capping)
+
+PATTERN: Separation of concerns (MVC-like)
+
+================================================================================
+END OF SUMMARY
+================================================================================

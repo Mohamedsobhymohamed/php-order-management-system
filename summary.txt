@@ -1,0 +1,2424 @@
+================================================================================
+BOOKSTORE DATABASE PROJECT - TECHNICAL OVERVIEW & QUERY DOCUMENTATION
+================================================================================
+Alexandria University - Database Systems - Fall 2025
+Generated: December 26, 2024
+
+================================================================================
+PROJECT ARCHITECTURE OVERVIEW
+================================================================================
+
+TECHNOLOGY STACK:
+- Backend: PHP 7.4+ with MySQLi (prepared statements)
+- Database: MySQL 5.7+ / MariaDB 10.3+
+- Frontend: HTML5, CSS3, Vanilla JavaScript
+- Architecture: MVC-like pattern (Model in DB, View in PHP templates, Controller in PHP logic)
+
+DATABASE DESIGN:
+- Normalization: 3NF (Third Normal Form)
+- 14 Tables with proper foreign key constraints
+- 5 Automated triggers for business logic
+- 3 Views for complex queries
+- 5 Stored procedures for reporting
+
+KEY DIFFERENCES: cart.php vs api/cart.php
+- cart.php: Server-side rendered page (displays cart UI)
+- api/cart.php: REST-like API endpoint (handles AJAX operations, returns JSON)
+
+================================================================================
+FILE-BY-FILE TECHNICAL BREAKDOWN
+================================================================================
+
+--------------------------------------------------------------------------------
+1. config/database.php
+--------------------------------------------------------------------------------
+PURPOSE: Database connection management and session initialization
+ROLE: Singleton pattern for database connection
+
+TECHNICAL DETAILS:
+- Uses MySQLi extension (not PDO)
+- Connection pooling via single function
+- UTF-8MB4 character set for emoji support
+- Session management (starts if not already active)
+
+DATABASE CONNECTION:
+```php
+function getConnection() {
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT);
+    if ($conn->connect_error) {
+        die("Connection failed: " . $conn->connect_error);
+    }
+    $conn->set_charset("utf8mb4");  // Important for international characters
+    return $conn;
+}
+```
+
+QUERIES: None (only connection management)
+
+--------------------------------------------------------------------------------
+2. index.php (Homepage)
+--------------------------------------------------------------------------------
+PURPOSE: Main product catalog with search and filter capabilities
+ROLE: Primary customer entry point
+
+TECHNICAL DETAILS:
+- Uses vw_books_full_details view (pre-joined data)
+- Dynamic query building based on GET parameters
+- Prepared statements prevent SQL injection
+- Uses GROUP_CONCAT for multiple authors per book
+
+DATABASE QUERIES:
+
+QUERY 1: Get filtered books with authors
+TYPE: SELECT with dynamic WHERE clauses
+COMPLEXITY: Medium (joins through view)
+```sql
+SELECT * FROM vw_books_full_details WHERE 1=1
+[+ AND (title LIKE ? OR isbn LIKE ?) if search]
+[+ AND category = ? if category filter]
+[+ AND authors LIKE ? if author filter]
+ORDER BY title
+```
+PARAMETERS:
+- search: string (wildcarded: %term%)
+- category: string (exact match from ENUM)
+- author: string (wildcarded: %name%)
+
+PREPARATION:
+```php
+$stmt = $conn->prepare($query);
+if (!empty($params)) {
+    $stmt->bind_param($types, ...$params);  // Dynamic binding
+}
+$stmt->execute();
+$books = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+```
+
+QUERY 2: Get cart count for header
+TYPE: SELECT with aggregate function
+COMPLEXITY: Low
+```sql
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+```
+PARAMETERS:
+- customer_id: integer
+
+PURPOSE: Display cart badge in navigation
+
+VIEW USED: vw_books_full_details
+- Pre-joins: Books + Book_Authors + Authors + Publishers
+- Aggregates: GROUP_CONCAT(author_name) for multiple authors
+- Performance: Indexed on isbn, author_id, publisher_id
+
+--------------------------------------------------------------------------------
+3. login.php (Customer Authentication)
+--------------------------------------------------------------------------------
+PURPOSE: Customer authentication and session management
+ROLE: Security gateway for customer features
+
+TECHNICAL DETAILS:
+- Password verification using password_verify()
+- Session-based authentication
+- Supports demo mode (plain text password for testing)
+- Optional redirect with add-to-cart after login
+
+DATABASE QUERIES:
+
+QUERY 1: Verify customer credentials
+TYPE: SELECT (authentication)
+COMPLEXITY: Low
+```sql
+SELECT customer_id, username, password_hash, first_name, last_name 
+FROM customers 
+WHERE username = ?
+```
+PARAMETERS:
+- username: string
+
+SECURITY:
+- Uses prepared statement (prevents SQL injection)
+- Password stored as bcrypt hash
+- Never returns password in response
+
+QUERY 2: Update last login timestamp
+TYPE: UPDATE
+COMPLEXITY: Low
+```sql
+UPDATE customers 
+SET last_login = NOW() 
+WHERE customer_id = ?
+```
+PARAMETERS:
+- customer_id: integer
+
+PURPOSE: Track user activity for analytics
+
+HELPER FUNCTION: addBookToCart() (if redirecting from product)
+Calls multiple queries:
+1. Get/create cart_id
+2. Check book stock
+3. Check existing cart item
+4. Insert or update cart item
+
+AUTHENTICATION FLOW:
+1. Verify username exists
+2. Verify password matches hash
+3. Create session variables
+4. Update last_login
+5. Redirect to destination
+
+--------------------------------------------------------------------------------
+4. register.php (Customer Registration)
+--------------------------------------------------------------------------------
+PURPOSE: New customer account creation with multi-valued attributes
+ROLE: User onboarding with normalized data structure
+
+TECHNICAL DETAILS:
+- ACID transaction (all or nothing)
+- Creates customer + phone + address + cart atomically
+- Supports multi-valued attributes (normalized 3NF)
+- Password hashing with PASSWORD_DEFAULT (bcrypt)
+
+DATABASE QUERIES (IN TRANSACTION):
+
+QUERY 1: Check username/email uniqueness
+TYPE: SELECT (validation)
+COMPLEXITY: Low
+```sql
+SELECT customer_id 
+FROM customers 
+WHERE username = ? OR email = ?
+```
+PARAMETERS:
+- username: string
+- email: string
+
+PURPOSE: Prevent duplicate accounts
+
+QUERY 2: Insert new customer
+TYPE: INSERT
+COMPLEXITY: Low
+```sql
+INSERT INTO customers (username, password_hash, first_name, last_name, email)
+VALUES (?, ?, ?, ?, ?)
+```
+PARAMETERS:
+- username: string
+- password_hash: string (bcrypt hashed)
+- first_name: string
+- last_name: string
+- email: string
+
+RETURNS: customer_id (auto_increment)
+
+QUERY 3: Insert customer phone
+TYPE: INSERT (multi-valued attribute)
+COMPLEXITY: Low
+```sql
+INSERT INTO customer_phones (customer_id, phone_number, phone_type, is_primary)
+VALUES (?, ?, ?, TRUE)
+```
+PARAMETERS:
+- customer_id: integer (from previous insert)
+- phone_number: string
+- phone_type: ENUM('Mobile', 'Home', 'Work')
+
+NORMALIZATION: Separate table for 1:N relationship
+
+QUERY 4: Insert customer address
+TYPE: INSERT (multi-valued attribute)
+COMPLEXITY: Low
+```sql
+INSERT INTO customer_addresses (customer_id, address_line1, address_line2, 
+    city, state, country, postal_code, address_type, is_default)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+```
+PARAMETERS:
+- customer_id: integer
+- address_line1: string
+- address_line2: string (nullable)
+- city: string
+- state: string (nullable)
+- country: string (default 'Egypt')
+- postal_code: string (nullable)
+- address_type: ENUM('Home', 'Work', 'Billing', 'Shipping')
+
+NORMALIZATION: Separate table for 1:N relationship
+
+QUERY 5: Create shopping cart
+TYPE: INSERT
+COMPLEXITY: Low
+```sql
+INSERT INTO shopping_cart (customer_id) 
+VALUES (?)
+```
+PARAMETERS:
+- customer_id: integer
+
+PURPOSE: Pre-create cart to avoid runtime checks
+
+TRANSACTION HANDLING:
+```php
+$conn->begin_transaction();
+try {
+    // Execute all 5 queries
+    $conn->commit();
+} catch (Exception $e) {
+    $conn->rollback();
+    $error = 'Registration failed: ' . $e->getMessage();
+}
+```
+
+ATOMICITY: Either all records created or none (ACID compliance)
+
+--------------------------------------------------------------------------------
+5. cart.php (Shopping Cart Display)
+--------------------------------------------------------------------------------
+PURPOSE: Server-side rendered shopping cart page
+ROLE: Display cart contents with UI controls
+
+TECHNICAL DETAILS:
+- Retrieves cart items with full book details
+- Joins multiple tables for complete information
+- Aggregates authors using GROUP_CONCAT
+- Calculates subtotals and totals
+- Renders HTML with cart items
+
+KEY DIFFERENCE FROM api/cart.php:
+- cart.php: Displays the cart (VIEW layer)
+- api/cart.php: Modifies the cart (CONTROLLER layer)
+
+DATABASE QUERIES:
+
+QUERY 1: Get or create cart_id
+TYPE: SELECT + conditional INSERT
+COMPLEXITY: Low
+```sql
+-- Check if cart exists
+SELECT cart_id 
+FROM shopping_cart 
+WHERE customer_id = ?
+
+-- If not exists, create it
+INSERT INTO shopping_cart (customer_id) 
+VALUES (?)
+```
+PARAMETERS:
+- customer_id: integer
+
+PATTERN: Lazy initialization
+
+QUERY 2: Get cart items with full details
+TYPE: SELECT with multiple JOINs and GROUP BY
+COMPLEXITY: High
+```sql
+SELECT 
+    sci.cart_item_id, 
+    sci.isbn, 
+    sci.quantity, 
+    b.title, 
+    b.selling_price, 
+    b.quantity_in_stock, 
+    b.image_url,
+    GROUP_CONCAT(a.author_name ORDER BY a.author_name SEPARATOR ', ') as authors
+FROM shopping_cart_items sci
+JOIN books b ON sci.isbn = b.isbn
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+WHERE sci.cart_id = ?
+GROUP BY sci.cart_item_id, sci.isbn, sci.quantity, 
+         b.title, b.selling_price, b.quantity_in_stock, b.image_url
+```
+PARAMETERS:
+- cart_id: integer
+
+JOINS EXPLAINED:
+1. sci → b: Get book details (INNER - must exist)
+2. b → ba: Get book-author links (LEFT - may have no authors)
+3. ba → a: Get author names (LEFT - cascades from ba)
+
+GROUP BY: Required for GROUP_CONCAT aggregation
+- Groups by all non-aggregated columns
+- Produces one row per cart item with concatenated authors
+
+AGGREGATION:
+- GROUP_CONCAT: Combines multiple authors into comma-separated string
+- ORDER BY: Sorts authors alphabetically
+- SEPARATOR: Custom delimiter (', ')
+
+QUERY 3: Get cart count for navigation badge
+TYPE: SELECT with aggregate
+COMPLEXITY: Low
+```sql
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+```
+PARAMETERS:
+- customer_id: integer
+
+PURPOSE: Display cart badge count in header
+
+RENDERING LOGIC:
+```php
+// Calculate totals in PHP (not SQL for clarity)
+$subtotal = 0;
+foreach ($cart_items as $item) {
+    $subtotal += $item['selling_price'] * $item['quantity'];
+}
+$total = $subtotal; // Could add tax/shipping here
+```
+
+NO WRITE OPERATIONS: This file only reads data
+
+--------------------------------------------------------------------------------
+6. api/cart.php (Shopping Cart API)
+--------------------------------------------------------------------------------
+PURPOSE: RESTful-style API endpoint for cart operations
+ROLE: AJAX handler for async cart modifications
+
+TECHNICAL DETAILS:
+- Returns JSON responses
+- No HTML rendering
+- Handles: add, update, remove, get_count, get_total
+- Stateless (uses session for auth)
+- Implements business logic (stock validation)
+
+KEY DIFFERENCE FROM cart.php:
+- api/cart.php: Modifies cart data (CONTROLLER layer)
+- cart.php: Displays cart UI (VIEW layer)
+- Separation of concerns (REST principles)
+
+API STRUCTURE:
+```php
+switch ($action) {
+    case 'add': addToCart(); break;
+    case 'update': updateCartQuantity(); break;
+    case 'remove': removeFromCart(); break;
+    case 'get_count': getCartCount(); break;
+    case 'get_total': getCartTotal(); break;
+}
+```
+
+DATABASE QUERIES BY ACTION:
+
+---
+ACTION: add (Add item to cart)
+---
+QUERY 1: Get or create cart
+```sql
+SELECT cart_id FROM shopping_cart WHERE customer_id = ?
+-- If none: INSERT INTO shopping_cart (customer_id) VALUES (?)
+```
+
+QUERY 2: Validate book and stock
+TYPE: SELECT (validation)
+COMPLEXITY: Low
+```sql
+SELECT title, quantity_in_stock 
+FROM books 
+WHERE isbn = ?
+```
+PURPOSE: Ensure book exists and has stock
+
+QUERY 3: Check if item already in cart
+TYPE: SELECT
+COMPLEXITY: Low
+```sql
+SELECT quantity 
+FROM shopping_cart_items 
+WHERE cart_id = ? AND isbn = ?
+```
+PURPOSE: Decide between INSERT or UPDATE
+
+QUERY 4a: Update existing item
+TYPE: UPDATE
+COMPLEXITY: Low
+```sql
+UPDATE shopping_cart_items 
+SET quantity = ? 
+WHERE cart_id = ? AND isbn = ?
+```
+PARAMETERS:
+- new_quantity: integer (existing + requested, capped at stock)
+- cart_id: integer
+- isbn: string
+
+QUERY 4b: Insert new item
+TYPE: INSERT
+COMPLEXITY: Low
+```sql
+INSERT INTO shopping_cart_items (cart_id, isbn, quantity) 
+VALUES (?, ?, ?)
+```
+PARAMETERS:
+- cart_id: integer
+- isbn: string
+- quantity: integer (validated against stock)
+
+QUERY 5: Get updated cart count
+TYPE: SELECT with aggregate
+COMPLEXITY: Low
+```sql
+SELECT SUM(quantity) as total 
+FROM shopping_cart_items 
+WHERE cart_id = ?
+```
+PURPOSE: Return new count to update UI badge
+
+RESPONSE:
+```json
+{
+    "success": true,
+    "message": "Added to cart",
+    "cart_count": 5
+}
+```
+
+---
+ACTION: update (Update item quantity)
+---
+QUERY 1: Get cart_id (same as add)
+
+QUERY 2: Validate stock
+```sql
+SELECT quantity_in_stock 
+FROM books 
+WHERE isbn = ?
+```
+PURPOSE: Cap quantity at available stock
+
+QUERY 3: Update quantity
+TYPE: UPDATE
+COMPLEXITY: Low
+```sql
+UPDATE shopping_cart_items 
+SET quantity = ? 
+WHERE cart_id = ? AND isbn = ?
+```
+PARAMETERS:
+- quantity: integer (validated)
+- cart_id: integer
+- isbn: string
+
+QUERY 4: Get updated totals
+Calls getCartTotals() which runs 2 queries:
+```sql
+-- Count
+SELECT SUM(quantity) as count 
+FROM shopping_cart_items 
+WHERE cart_id = ?
+
+-- Total price
+SELECT SUM(b.selling_price * sci.quantity) as total 
+FROM shopping_cart_items sci 
+JOIN books b ON sci.isbn = b.isbn 
+WHERE sci.cart_id = ?
+```
+
+RESPONSE:
+```json
+{
+    "success": true,
+    "cart_count": 4,
+    "cart_total": "159.96"
+}
+```
+
+---
+ACTION: remove (Remove item from cart)
+---
+QUERY 1: Delete item
+TYPE: DELETE
+COMPLEXITY: Low
+```sql
+DELETE FROM shopping_cart_items 
+WHERE cart_id = ? AND isbn = ?
+```
+PARAMETERS:
+- cart_id: integer
+- isbn: string
+
+QUERY 2: Get updated totals (same as update action)
+
+RESPONSE:
+```json
+{
+    "success": true,
+    "message": "Item removed",
+    "cart_count": 3,
+    "cart_total": "109.97"
+}
+```
+
+---
+ACTION: get_count (Get cart count only)
+---
+QUERY: Single aggregate
+```sql
+SELECT SUM(quantity) as count 
+FROM shopping_cart_items 
+WHERE cart_id = ?
+```
+
+RESPONSE:
+```json
+{
+    "success": true,
+    "cart_count": 3
+}
+```
+
+---
+ACTION: get_total (Get count and total)
+---
+QUERIES: Same as getCartTotals() (2 queries)
+
+RESPONSE:
+```json
+{
+    "success": true,
+    "cart_count": 3,
+    "cart_total": "109.97"
+}
+```
+
+BUSINESS LOGIC:
+- Stock validation before add/update
+- Quantity capping at available stock
+- Atomic operations (single query per action)
+- Error handling with JSON error responses
+
+ERROR RESPONSE:
+```json
+{
+    "success": false,
+    "message": "Insufficient stock"
+}
+```
+
+SECURITY:
+- Session-based authentication
+- Prepared statements for all queries
+- Validates ownership (cart belongs to customer)
+
+--------------------------------------------------------------------------------
+7. checkout.php (Order Processing)
+--------------------------------------------------------------------------------
+PURPOSE: Complete order transaction with payment and shipping
+ROLE: E-commerce checkout flow
+
+TECHNICAL DETAILS:
+- Complex ACID transaction
+- Row-level locking (FOR UPDATE)
+- Validates stock before order
+- Creates order + order items atomically
+- Triggers fire automatically (stock updates)
+- Supports saved payment methods and addresses
+
+DATABASE QUERIES:
+
+QUERY 1: Get cart_id
+```sql
+SELECT cart_id 
+FROM shopping_cart 
+WHERE customer_id = ?
+```
+
+QUERY 2: Get cart items with stock info
+TYPE: SELECT with JOINs
+COMPLEXITY: Medium
+```sql
+SELECT sci.isbn, sci.quantity, b.title, b.selling_price, b.quantity_in_stock
+FROM shopping_cart_items sci
+JOIN books b ON sci.isbn = b.isbn
+WHERE sci.cart_id = ?
+```
+PURPOSE: Prepare order items
+
+QUERY 3: Get saved payment methods
+TYPE: SELECT
+COMPLEXITY: Low
+```sql
+SELECT * FROM payment_methods 
+WHERE customer_id = ?
+ORDER BY is_default DESC, created_at DESC
+```
+PURPOSE: Allow customer to select saved card
+
+QUERY 4: Get saved addresses
+TYPE: SELECT
+COMPLEXITY: Low
+```sql
+SELECT * FROM customer_addresses 
+WHERE customer_id = ?
+ORDER BY is_default DESC
+```
+PURPOSE: Allow customer to select shipping address
+
+--- CHECKOUT TRANSACTION BEGINS ---
+
+QUERY 5: Verify payment method ownership
+TYPE: SELECT (security check)
+COMPLEXITY: Low
+```sql
+SELECT payment_id 
+FROM payment_methods 
+WHERE payment_id = ? AND customer_id = ?
+```
+PURPOSE: Prevent unauthorized payment method use
+
+QUERY 6: Insert new payment method (if adding new card)
+TYPE: INSERT
+COMPLEXITY: Low
+```sql
+INSERT INTO payment_methods 
+    (customer_id, card_number, card_holder_name, expiry_date, card_type, is_default)
+VALUES (?, ?, ?, ?, ?, ?)
+```
+RETURNS: payment_id
+
+QUERY 7: Verify address ownership
+TYPE: SELECT (security check)
+COMPLEXITY: Low
+```sql
+SELECT address_id 
+FROM customer_addresses 
+WHERE address_id = ? AND customer_id = ?
+```
+
+QUERY 8: Check stock with row lock
+TYPE: SELECT FOR UPDATE (pessimistic locking)
+COMPLEXITY: Low
+CRITICAL: Prevents race conditions
+```sql
+SELECT quantity_in_stock 
+FROM books 
+WHERE isbn = ? 
+FOR UPDATE
+```
+EXPLANATION:
+- FOR UPDATE: Locks row until transaction completes
+- Prevents concurrent orders from overselling
+- Other transactions wait for lock release
+- Essential for inventory management
+
+QUERY 9: Create customer order
+TYPE: INSERT
+COMPLEXITY: Medium
+```sql
+INSERT INTO customer_orders 
+    (customer_id, payment_id, shipping_address_id, total_amount, order_status)
+VALUES (?, ?, ?, ?, 'Completed')
+```
+PARAMETERS:
+- customer_id: integer
+- payment_id: integer (foreign key)
+- shipping_address_id: integer (foreign key)
+- total_amount: decimal(10,2)
+
+RETURNS: order_id (auto_increment)
+
+QUERY 10: Insert order items (loops for each item)
+TYPE: INSERT (triggers fire here!)
+COMPLEXITY: Low but CRITICAL
+```sql
+INSERT INTO order_items (order_id, isbn, quantity, unit_price)
+VALUES (?, ?, ?, ?)
+```
+PARAMETERS:
+- order_id: integer
+- isbn: string
+- quantity: integer
+- unit_price: decimal(10,2)
+
+TRIGGERS THAT FIRE:
+1. trg_before_order_item_insert: Calculates subtotal
+2. trg_after_order_item_insert: Decrements book stock
+
+TRIGGER LOGIC:
+```sql
+-- Trigger 1 (BEFORE INSERT)
+CREATE TRIGGER trg_before_order_item_insert
+BEFORE INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    IF NEW.subtotal IS NULL THEN
+        SET NEW.subtotal = NEW.quantity * NEW.unit_price;
+    END IF;
+END;
+
+-- Trigger 2 (AFTER INSERT)
+CREATE TRIGGER trg_after_order_item_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    UPDATE books 
+    SET quantity_in_stock = quantity_in_stock - NEW.quantity
+    WHERE isbn = NEW.isbn;
+END;
+```
+
+QUERY 11: Clear cart
+TYPE: DELETE
+COMPLEXITY: Low
+```sql
+DELETE FROM shopping_cart_items 
+WHERE cart_id = ?
+```
+PURPOSE: Empty cart after successful order
+
+--- TRANSACTION COMMIT ---
+
+TRANSACTION HANDLING:
+```php
+$conn->begin_transaction();
+try {
+    // Execute queries 5-11
+    $conn->commit();
+    header("Location: orders.php?success=1&order_id=$order_id");
+} catch (Exception $e) {
+    $conn->rollback();
+    $error = $e->getMessage();
+}
+```
+
+ATOMICITY GUARANTEES:
+- Either full order created or nothing
+- Stock never oversold due to FOR UPDATE
+- Cart cleared only if order succeeds
+- Referential integrity maintained
+
+ERROR HANDLING:
+- Insufficient stock: Rollback, show error
+- Invalid payment/address: Rollback, show error
+- Database error: Rollback, log error
+
+BUSINESS RULES ENFORCED:
+1. Stock validation before order
+2. Price locked at order time
+3. Payment and address must exist
+4. Cart cleared after order
+5. Automatic stock decrement
+
+--------------------------------------------------------------------------------
+8. orders.php (Order History)
+--------------------------------------------------------------------------------
+PURPOSE: Display customer order history
+ROLE: Order tracking and history
+
+TECHNICAL DETAILS:
+- Uses direct queries instead of view (avoids view errors)
+- Two-query pattern: orders + items
+- Groups items by order_id in PHP
+- Shows complete order details
+
+DATABASE QUERIES:
+
+QUERY 1: Get customer orders with address
+TYPE: SELECT with LEFT JOIN
+COMPLEXITY: Medium
+```sql
+SELECT 
+    co.order_id,
+    co.order_date,
+    co.total_amount,
+    co.order_status,
+    ca.address_line1,
+    ca.city,
+    ca.country
+FROM customer_orders co
+LEFT JOIN customer_addresses ca ON co.shipping_address_id = ca.address_id
+WHERE co.customer_id = ?
+ORDER BY co.order_date DESC
+```
+PARAMETERS:
+- customer_id: integer
+
+LEFT JOIN: Address might be deleted, still show order
+
+QUERY 2: Get order items for each order (loops)
+TYPE: SELECT with JOIN
+COMPLEXITY: Low
+```sql
+SELECT 
+    oi.isbn, 
+    oi.quantity, 
+    oi.unit_price, 
+    oi.subtotal, 
+    b.title
+FROM order_items oi
+JOIN books b ON oi.isbn = b.isbn
+WHERE oi.order_id = ?
+```
+PARAMETERS:
+- order_id: integer (from previous query)
+
+N+1 QUERY PROBLEM:
+- Could be optimized with single query using GROUP_CONCAT
+- Current approach: Loops for each order
+- Acceptable for small datasets (<100 orders per page)
+
+OPTIMIZATION OPPORTUNITY:
+```sql
+-- Better: Single query with GROUP BY
+SELECT 
+    co.*,
+    JSON_ARRAYAGG(
+        JSON_OBJECT(
+            'isbn', oi.isbn,
+            'title', b.title,
+            'quantity', oi.quantity,
+            'price', oi.unit_price,
+            'subtotal', oi.subtotal
+        )
+    ) as items
+FROM customer_orders co
+LEFT JOIN order_items oi ON co.order_id = oi.order_id
+LEFT JOIN books b ON oi.isbn = b.isbn
+WHERE co.customer_id = ?
+GROUP BY co.order_id
+```
+
+QUERY 3: Get cart count (header badge)
+TYPE: SELECT with aggregate
+```sql
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+```
+
+--------------------------------------------------------------------------------
+9. logout.php (Session Termination)
+--------------------------------------------------------------------------------
+PURPOSE: Clear cart and destroy session
+ROLE: Security cleanup and business rule enforcement
+
+TECHNICAL DETAILS:
+- Implements business requirement: "Logout removes cart items"
+- Two-query pattern: get cart, clear items
+- Session destruction after database cleanup
+
+DATABASE QUERIES:
+
+QUERY 1: Get cart_id
+TYPE: SELECT
+COMPLEXITY: Low
+```sql
+SELECT cart_id 
+FROM shopping_cart 
+WHERE customer_id = ?
+```
+PARAMETERS:
+- customer_id: integer (from session)
+
+QUERY 2: Clear all cart items
+TYPE: DELETE
+COMPLEXITY: Low
+CRITICAL: Business requirement
+```sql
+DELETE FROM shopping_cart_items 
+WHERE cart_id = ?
+```
+PARAMETERS:
+- cart_id: integer (from previous query)
+
+PURPOSE: Per project requirements - logout must clear cart
+
+SESSION CLEANUP:
+```php
+session_unset();   // Clear all session variables
+session_destroy(); // Destroy session file
+```
+
+FLOW:
+1. Check if customer is logged in
+2. Get their cart_id
+3. Delete all items in cart
+4. Destroy session
+5. Redirect to homepage
+
+BUSINESS RULE: Cart is temporary, tied to session
+
+--------------------------------------------------------------------------------
+10. profile.php (Customer Profile Management)
+--------------------------------------------------------------------------------
+PURPOSE: Manage customer account, phones, addresses, payment methods
+ROLE: CRUD operations for customer multi-valued attributes
+
+TECHNICAL DETAILS:
+- Multiple POST actions handled in one file
+- Demonstrates 1:N relationships (customer:phones, customer:addresses)
+- Shows normalization in action
+- Uses is_primary and is_default flags
+
+DATABASE QUERIES BY ACTION:
+
+---
+ACTION: update_profile
+---
+QUERY: Update customer basic info
+TYPE: UPDATE
+COMPLEXITY: Low
+```sql
+UPDATE customers 
+SET first_name = ?, last_name = ?, email = ? 
+WHERE customer_id = ?
+```
+PARAMETERS:
+- first_name: string
+- last_name: string
+- email: string
+- customer_id: integer
+
+---
+ACTION: change_password
+---
+QUERY 1: Get current password hash
+```sql
+SELECT password_hash 
+FROM customers 
+WHERE customer_id = ?
+```
+
+QUERY 2: Update password
+```sql
+UPDATE customers 
+SET password_hash = ? 
+WHERE customer_id = ?
+```
+PARAMETERS:
+- password_hash: string (bcrypt hashed)
+- customer_id: integer
+
+SECURITY: Verifies current password before allowing change
+
+---
+ACTION: add_phone
+---
+QUERY: Insert new phone
+TYPE: INSERT (multi-valued attribute)
+COMPLEXITY: Low
+```sql
+INSERT INTO customer_phones (customer_id, phone_number, phone_type) 
+VALUES (?, ?, ?)
+```
+DEMONSTRATES: 1:N relationship (one customer, many phones)
+
+---
+ACTION: delete_phone
+---
+QUERY: Delete phone
+TYPE: DELETE
+COMPLEXITY: Low
+```sql
+DELETE FROM customer_phones 
+WHERE phone_id = ? AND customer_id = ?
+```
+SECURITY: Validates ownership with customer_id
+
+---
+ACTION: set_primary_phone
+---
+QUERY 1: Unset all as primary
+```sql
+UPDATE customer_phones 
+SET is_primary = 0 
+WHERE customer_id = ?
+```
+
+QUERY 2: Set selected as primary
+```sql
+UPDATE customer_phones 
+SET is_primary = 1 
+WHERE phone_id = ? AND customer_id = ?
+```
+PATTERN: Toggle flag pattern (only one primary per customer)
+
+---
+ACTION: add_address
+---
+QUERY: Insert new address
+TYPE: INSERT (multi-valued attribute)
+COMPLEXITY: Low
+```sql
+INSERT INTO customer_addresses 
+    (customer_id, address_line1, address_line2, city, state, 
+     country, postal_code, address_type) 
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+```
+DEMONSTRATES: 1:N relationship (one customer, many addresses)
+
+---
+ACTION: delete_address
+---
+QUERY: Delete address
+```sql
+DELETE FROM customer_addresses 
+WHERE address_id = ? AND customer_id = ?
+```
+
+---
+ACTION: set_default_address
+---
+QUERY 1: Unset all as default
+```sql
+UPDATE customer_addresses 
+SET is_default = 0 
+WHERE customer_id = ?
+```
+
+QUERY 2: Set selected as default
+```sql
+UPDATE customer_addresses 
+SET is_default = 1 
+WHERE address_id = ? AND customer_id = ?
+```
+PATTERN: Same toggle pattern for default address
+
+---
+ACTION: delete_payment
+---
+QUERY: Delete payment method
+```sql
+DELETE FROM payment_methods 
+WHERE payment_id = ? AND customer_id = ?
+```
+
+---
+ACTION: set_default_payment
+---
+QUERY 1: Unset all as default
+```sql
+UPDATE payment_methods 
+SET is_default = 0 
+WHERE customer_id = ?
+```
+
+QUERY 2: Set selected as default
+```sql
+UPDATE payment_methods 
+SET is_default = 1 
+WHERE payment_id = ? AND customer_id = ?
+```
+
+---
+READ QUERIES (Page Load):
+---
+QUERY 1: Get customer info
+```sql
+SELECT * FROM customers WHERE customer_id = ?
+```
+
+QUERY 2: Get all phones
+```sql
+SELECT * FROM customer_phones 
+WHERE customer_id = ? 
+ORDER BY is_primary DESC
+```
+ORDER BY: Primary phone first
+
+QUERY 3: Get all addresses
+```sql
+SELECT * FROM customer_addresses 
+WHERE customer_id = ? 
+ORDER BY is_default DESC
+```
+ORDER BY: Default address first
+
+QUERY 4: Get all payment methods
+```sql
+SELECT * FROM payment_methods 
+WHERE customer_id = ? 
+ORDER BY is_default DESC
+```
+ORDER BY: Default payment first
+
+QUERY 5: Get cart count (header)
+```sql
+SELECT SUM(sci.quantity) as total 
+FROM shopping_cart sc 
+JOIN shopping_cart_items sci ON sc.cart_id = sci.cart_id 
+WHERE sc.customer_id = ?
+```
+
+NORMALIZATION BENEFIT:
+- Can add unlimited phones per customer
+- Can add unlimited addresses per customer
+- Can add unlimited payment methods per customer
+- No schema changes needed for additional entries
+
+--------------------------------------------------------------------------------
+11. admin/login.php (Admin Authentication)
+--------------------------------------------------------------------------------
+PURPOSE: Admin authentication
+ROLE: Security gateway for admin panel
+
+DATABASE QUERIES:
+
+QUERY 1: Verify admin credentials
+TYPE: SELECT (authentication)
+COMPLEXITY: Low
+```sql
+SELECT admin_id, username, first_name, last_name 
+FROM administrators 
+WHERE username = ?
+```
+PARAMETERS:
+- username: string
+
+SIMILAR TO: Customer login but uses administrators table
+
+QUERY 2: Update last login
+```sql
+UPDATE administrators 
+SET last_login = NOW() 
+WHERE admin_id = ?
+```
+
+SECURITY: Same pattern as customer login
+
+--------------------------------------------------------------------------------
+12. admin/dashboard.php (Admin Dashboard)
+--------------------------------------------------------------------------------
+PURPOSE: Display key business metrics
+ROLE: Business intelligence summary
+
+DATABASE QUERIES (All simple aggregates):
+
+QUERY 1: Total books count
+```sql
+SELECT COUNT(*) as count FROM books
+```
+
+QUERY 2: Total customers count
+```sql
+SELECT COUNT(*) as count FROM customers
+```
+
+QUERY 3: Total orders count
+```sql
+SELECT COUNT(*) as count FROM customer_orders
+```
+
+QUERY 4: Total revenue
+```sql
+SELECT COALESCE(SUM(total_amount), 0) as total 
+FROM customer_orders 
+WHERE order_status = 'Completed'
+```
+COALESCE: Returns 0 if NULL (no orders)
+
+QUERY 5: Today's orders
+```sql
+SELECT COUNT(*) as count 
+FROM customer_orders 
+WHERE DATE(order_date) = CURDATE()
+```
+CURDATE(): MySQL function for current date
+
+QUERY 6: Pending publisher orders
+```sql
+SELECT COUNT(*) as count 
+FROM publisher_orders 
+WHERE order_status = 'Pending'
+```
+
+QUERY 7: Low stock books count
+```sql
+SELECT COUNT(*) as count 
+FROM books 
+WHERE quantity_in_stock < minimum_threshold
+```
+BUSINESS RULE: Alert when stock below threshold
+
+QUERY 8: Recent orders with customer info
+TYPE: SELECT with JOIN
+COMPLEXITY: Medium
+```sql
+SELECT 
+    co.order_id, 
+    co.order_date, 
+    co.total_amount, 
+    co.order_status,
+    CONCAT(c.first_name, ' ', c.last_name) as customer_name
+FROM customer_orders co
+JOIN customers c ON co.customer_id = c.customer_id
+ORDER BY co.order_date DESC
+LIMIT 5
+```
+CONCAT: Combines first and last name
+
+QUERY 9: Low stock books list (using view)
+```sql
+SELECT * FROM vw_low_stock_books LIMIT 5
+```
+
+VIEW DEFINITION: vw_low_stock_books
+```sql
+CREATE VIEW vw_low_stock_books AS
+SELECT 
+    b.isbn,
+    b.title,
+    GROUP_CONCAT(a.author_name SEPARATOR ', ') AS authors,
+    p.publisher_name,
+    b.quantity_in_stock,
+    b.minimum_threshold,
+    (b.minimum_threshold - b.quantity_in_stock) AS reorder_quantity
+FROM books b
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE b.quantity_in_stock < b.minimum_threshold
+GROUP BY b.isbn
+```
+
+PURPOSE: Quick dashboard metrics for admin
+
+--------------------------------------------------------------------------------
+13. admin/books.php (Book Management - CRUD)
+--------------------------------------------------------------------------------
+PURPOSE: Complete book inventory management
+ROLE: Admin CRUD operations on books
+
+TECHNICAL DETAILS:
+- Add, edit, delete books
+- Manage multiple authors per book
+- Image upload support
+- Transaction-based for data integrity
+- Dynamic author field management
+
+DATABASE QUERIES BY ACTION:
+
+---
+ACTION: add (Add new book)
+---
+TRANSACTION START
+
+QUERY 1: Check ISBN uniqueness
+```sql
+SELECT isbn FROM books WHERE isbn = ?
+```
+PURPOSE: Prevent duplicate books
+
+QUERY 2: Insert book
+TYPE: INSERT
+COMPLEXITY: Medium
+```sql
+INSERT INTO books 
+    (isbn, title, publisher_id, publication_year, selling_price, 
+     category, image_url, quantity_in_stock, minimum_threshold)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+```
+PARAMETERS:
+- isbn: string (13 characters)
+- title: string
+- publisher_id: integer (foreign key)
+- publication_year: integer
+- selling_price: decimal(10,2)
+- category: ENUM('Science', 'Art', 'Religion', 'History', 'Geography')
+- image_url: string (filename)
+- quantity_in_stock: integer
+- minimum_threshold: integer
+
+QUERY 3: Check if author exists (loops for each author)
+```sql
+SELECT author_id 
+FROM authors 
+WHERE author_name = ?
+```
+
+QUERY 4a: Insert new author (if doesn't exist)
+```sql
+INSERT INTO authors (author_name) VALUES (?)
+```
+RETURNS: author_id (auto_increment)
+
+QUERY 4b: Link book to author
+TYPE: INSERT (junction table)
+COMPLEXITY: Low
+```sql
+INSERT INTO book_authors (isbn, author_id) 
+VALUES (?, ?)
+```
+DEMONSTRATES: Many-to-many relationship
+
+TRANSACTION COMMIT
+
+---
+ACTION: edit (Update existing book)
+---
+TRANSACTION START
+
+QUERY 1: Update book details
+```sql
+UPDATE books 
+SET title = ?, publisher_id = ?, publication_year = ?, 
+    selling_price = ?, category = ?, quantity_in_stock = ?, 
+    minimum_threshold = ?
+WHERE isbn = ?
+```
+NOTE: ISBN cannot be changed (primary key)
+
+QUERY 2: Remove all author links
+```sql
+DELETE FROM book_authors WHERE isbn = ?
+```
+PURPOSE: Clean slate before re-linking
+
+QUERY 3-4: Same as add action (check/create authors, link)
+
+TRANSACTION COMMIT
+
+PATTERN: Delete and recreate relationships
+- Simpler than comparing differences
+- Ensures consistency
+- Acceptable for small datasets
+
+---
+ACTION: delete (Delete book)
+---
+QUERY 1: Check if book has orders
+TYPE: SELECT (validation)
+COMPLEXITY: Low
+CRITICAL: Prevent data integrity issues
+```sql
+SELECT COUNT(*) as count 
+FROM order_items 
+WHERE isbn = ?
+```
+PURPOSE: Cannot delete books with order history
+
+QUERY 2: Delete from cart (cleanup)
+```sql
+DELETE FROM shopping_cart_items WHERE isbn = ?
+```
+
+QUERY 3: Delete publisher orders (cleanup)
+```sql
+DELETE FROM publisher_orders WHERE isbn = ?
+```
+
+QUERY 4: Delete author links (cleanup)
+```sql
+DELETE FROM book_authors WHERE isbn = ?
+```
+
+QUERY 5: Delete book
+```sql
+DELETE FROM books WHERE isbn = ?
+```
+
+CASCADE: Author links deleted via foreign key CASCADE
+BUSINESS RULE: Books with orders cannot be deleted
+
+---
+ACTION: update_stock (Quick stock update)
+---
+QUERY: Update stock only
+```sql
+UPDATE books 
+SET quantity_in_stock = ? 
+WHERE isbn = ?
+```
+TRIGGERS: May fire trg_after_book_update_reorder
+
+---
+READ QUERIES (Page Load):
+---
+QUERY 1: Get all books with authors
+TYPE: SELECT with multiple JOINs and GROUP BY
+COMPLEXITY: High
+```sql
+SELECT 
+    b.*, 
+    p.publisher_name,
+    GROUP_CONCAT(a.author_id) as author_ids,
+    GROUP_CONCAT(a.author_name ORDER BY a.author_name SEPARATOR ', ') as authors
+FROM books b
+LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+GROUP BY b.isbn
+ORDER BY b.title
+```
+AGGREGATION:
+- author_ids: For JavaScript to pre-select in edit form
+- authors: Display string for table
+
+QUERY 2: Get all authors (for dropdowns)
+```sql
+SELECT * FROM authors ORDER BY author_name
+```
+
+QUERY 3: Get all publishers (for dropdowns)
+```sql
+SELECT * FROM publishers ORDER BY publisher_name
+```
+
+NORMALIZATION IN ACTION:
+- Books: 1 record per book
+- Authors: Reusable across books
+- Book_Authors: Links many books to many authors
+- No redundancy in author names
+
+--------------------------------------------------------------------------------
+14. admin/orders.php (Order Management)
+--------------------------------------------------------------------------------
+PURPOSE: Manage publisher and customer orders
+ROLE: Inventory replenishment and order tracking
+
+DATABASE QUERIES BY ACTION:
+
+---
+ACTION: confirm_order (Confirm publisher order)
+---
+QUERY: Update order status
+TYPE: UPDATE
+COMPLEXITY: Low
+CRITICAL: Triggers fire here!
+```sql
+UPDATE publisher_orders 
+SET order_status = 'Confirmed', confirmed_date = NOW() 
+WHERE order_id = ?
+```
+
+TRIGGER THAT FIRES: trg_after_publisher_order_confirm
+```sql
+CREATE TRIGGER trg_after_publisher_order_confirm
+AFTER UPDATE ON publisher_orders
+FOR EACH ROW
+BEGIN
+    IF OLD.order_status = 'Pending' AND NEW.order_status = 'Confirmed' THEN
+        UPDATE books 
+        SET quantity_in_stock = quantity_in_stock + NEW.quantity_ordered
+        WHERE isbn = NEW.isbn;
+    END IF;
+END;
+```
+AUTOMATIC: Stock increases without additional PHP code
+
+---
+ACTION: cancel_order
+---
+QUERY: Cancel order
+```sql
+UPDATE publisher_orders 
+SET order_status = 'Cancelled' 
+WHERE order_id = ?
+```
+NO TRIGGER: Stock not affected on cancellation
+
+---
+READ QUERIES:
+---
+QUERY 1: Get pending publisher orders
+TYPE: SELECT with multiple JOINs
+COMPLEXITY: Medium
+```sql
+SELECT 
+    po.*, 
+    b.title, 
+    p.publisher_name
+FROM publisher_orders po
+JOIN books b ON po.isbn = b.isbn
+JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE po.order_status = 'Pending'
+ORDER BY po.order_date DESC
+```
+PURPOSE: Admin can see what needs to be confirmed
+
+QUERY 2: Get confirmed publisher orders
+```sql
+SELECT 
+    po.*, 
+    b.title, 
+    p.publisher_name
+FROM publisher_orders po
+JOIN books b ON po.isbn = b.isbn
+JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE po.order_status = 'Confirmed'
+ORDER BY po.confirmed_date DESC 
+LIMIT 10
+```
+LIMIT: Only recent history
+
+QUERY 3: Get customer orders summary
+TYPE: SELECT with GROUP BY
+COMPLEXITY: Medium
+```sql
+SELECT 
+    co.*, 
+    CONCAT(c.first_name, ' ', c.last_name) as customer_name,
+    c.email,
+    COUNT(oi.order_item_id) as item_count
+FROM customer_orders co
+JOIN customers c ON co.customer_id = c.customer_id
+LEFT JOIN order_items oi ON co.order_id = oi.order_id
+GROUP BY co.order_id
+ORDER BY co.order_date DESC 
+LIMIT 20
+```
+AGGREGATION: Count items per order
+
+TRIGGER INTEGRATION:
+- Publisher order confirmation automatically updates stock
+- No manual stock adjustment needed
+- Demonstrates trigger automation
+
+--------------------------------------------------------------------------------
+15. admin/reports.php (Business Intelligence Reports)
+--------------------------------------------------------------------------------
+PURPOSE: Generate sales and performance reports
+ROLE: Business analytics using stored procedures
+
+TECHNICAL DETAILS:
+- Uses stored procedures for complex queries
+- Supports date ranges and parameters
+- Shows top customers and products
+- Aggregates sales data
+
+DATABASE QUERIES (All call stored procedures):
+
+---
+REPORT: previous_month (Sales for previous month)
+---
+QUERY: Call stored procedure
+```sql
+CALL get_sales_previous_month()
+```
+
+PROCEDURE DEFINITION:
+```sql
+CREATE PROCEDURE get_sales_previous_month()
+BEGIN
+    SELECT 
+        DATE(co.order_date) AS sale_date,
+        COUNT(DISTINCT co.order_id) AS total_orders,
+        SUM(oi.subtotal) AS total_sales
+    FROM customer_orders co
+    JOIN order_items oi ON co.order_id = oi.order_id
+    WHERE co.order_date >= DATE_SUB(CURDATE(), INTERVAL 1 MONTH)
+      AND co.order_status = 'Completed'
+    GROUP BY DATE(co.order_date)
+    ORDER BY sale_date DESC;
+END
+```
+AGGREGATION:
+- Groups by date
+- Counts orders
+- Sums sales
+DATE_SUB: MySQL date arithmetic
+
+---
+REPORT: specific_date (Sales for specific date)
+---
+QUERY: Call stored procedure with parameter
+```sql
+CALL get_sales_for_date(?)
+```
+PARAMETER: date (YYYY-MM-DD)
+
+PROCEDURE DEFINITION:
+```sql
+CREATE PROCEDURE get_sales_for_date(IN p_date DATE)
+BEGIN
+    SELECT 
+        b.title,
+        SUM(oi.quantity) AS copies_sold,
+        SUM(oi.subtotal) AS total_revenue
+    FROM customer_orders co
+    JOIN order_items oi ON co.order_id = oi.order_id
+    JOIN books b ON oi.isbn = b.isbn
+    WHERE DATE(co.order_date) = p_date
+      AND co.order_status = 'Completed'
+    GROUP BY b.isbn
+    ORDER BY total_revenue DESC;
+END
+```
+AGGREGATION: By book, shows what sold on specific date
+
+---
+REPORT: top_customers (Top 5 customers by spending)
+---
+QUERY: Call stored procedure
+```sql
+CALL get_top_customers(3)
+```
+PARAMETER: months (integer) - default 3
+
+PROCEDURE DEFINITION:
+```sql
+CREATE PROCEDURE get_top_customers(IN p_months INT)
+BEGIN
+    SELECT 
+        c.customer_id,
+        CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+        c.email,
+        COUNT(DISTINCT co.order_id) AS total_orders,
+        SUM(co.total_amount) AS total_spent
+    FROM customers c
+    JOIN customer_orders co ON c.customer_id = co.customer_id
+    WHERE co.order_date >= DATE_SUB(CURDATE(), INTERVAL p_months MONTH)
+      AND co.order_status = 'Completed'
+    GROUP BY c.customer_id
+    ORDER BY total_spent DESC
+    LIMIT 5;
+END
+```
+PURPOSE: Identify best customers for marketing
+
+---
+REPORT: top_books (Top 10 selling books)
+---
+QUERY: Call stored procedure
+```sql
+CALL get_top_selling_books(3)
+```
+PARAMETER: months (integer)
+
+PROCEDURE DEFINITION:
+```sql
+CREATE PROCEDURE get_top_selling_books(IN p_months INT)
+BEGIN
+    SELECT 
+        b.isbn,
+        b.title,
+        GROUP_CONCAT(DISTINCT a.author_name SEPARATOR ', ') AS authors,
+        SUM(oi.quantity) AS copies_sold,
+        SUM(oi.subtotal) AS total_revenue
+    FROM books b
+    JOIN order_items oi ON b.isbn = oi.isbn
+    JOIN customer_orders co ON oi.order_id = co.order_id
+    LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+    LEFT JOIN authors a ON ba.author_id = a.author_id
+    WHERE co.order_date >= DATE_SUB(CURDATE(), INTERVAL p_months MONTH)
+      AND co.order_status = 'Completed'
+    GROUP BY b.isbn
+    ORDER BY copies_sold DESC
+    LIMIT 10;
+END
+```
+PURPOSE: Identify bestsellers
+
+---
+REPORT: book_orders (Publisher order count for book)
+---
+QUERY: Call stored procedure
+```sql
+CALL get_book_order_count(?)
+```
+PARAMETER: isbn (string)
+
+PROCEDURE DEFINITION:
+```sql
+CREATE PROCEDURE get_book_order_count(IN p_isbn VARCHAR(13))
+BEGIN
+    SELECT 
+        b.isbn,
+        b.title,
+        COUNT(po.order_id) AS times_ordered,
+        SUM(po.quantity_ordered) AS total_quantity_ordered
+    FROM books b
+    LEFT JOIN publisher_orders po ON b.isbn = po.isbn
+    WHERE b.isbn = p_isbn
+    GROUP BY b.isbn;
+END
+```
+PURPOSE: Track replenishment frequency
+
+STORED PROCEDURE BENEFITS:
+- Pre-compiled (faster execution)
+- Encapsulates complex logic
+- Reusable across applications
+- Consistent results
+
+POST-PROCESSING IN PHP:
+```php
+$result = $conn->query("CALL procedure_name()");
+$data = $result->fetch_all(MYSQLI_ASSOC);
+$result->close();
+$conn->next_result(); // CRITICAL: Clear result set for next query
+```
+
+--------------------------------------------------------------------------------
+16. admin/logout.php
+--------------------------------------------------------------------------------
+PURPOSE: Admin session termination
+ROLE: Security cleanup
+
+QUERIES: None (only session destruction)
+
+```php
+unset($_SESSION['admin_id']);
+unset($_SESSION['admin_username']);
+unset($_SESSION['admin_name']);
+```
+
+DIFFERENCE FROM CUSTOMER LOGOUT:
+- No cart clearing (admins don't have carts)
+- Only session cleanup
+- Redirects to admin login
+
+================================================================================
+DATABASE VIEWS DOCUMENTATION
+================================================================================
+
+---
+VIEW 1: vw_books_full_details
+---
+PURPOSE: Pre-joined book information
+COMPLEXITY: Medium
+
+DEFINITION:
+```sql
+CREATE VIEW vw_books_full_details AS
+SELECT 
+    b.isbn,
+    b.title,
+    GROUP_CONCAT(a.author_name ORDER BY a.author_name SEPARATOR ', ') AS authors,
+    p.publisher_name,
+    b.publication_year,
+    b.selling_price,
+    b.category,
+    b.image_url,
+    b.quantity_in_stock,
+    b.minimum_threshold
+FROM books b
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
+GROUP BY b.isbn;
+```
+
+USED IN:
+- index.php (homepage book listing)
+- Any page that needs complete book info
+
+BENEFITS:
+- Simplifies queries
+- Consistent author aggregation
+- Pre-computed joins
+- Single point of definition
+
+AGGREGATION: GROUP_CONCAT combines multiple authors
+
+---
+VIEW 2: vw_customer_order_history
+---
+PURPOSE: Complete order details with items
+COMPLEXITY: High
+
+DEFINITION:
+```sql
+CREATE VIEW vw_customer_order_history AS
+SELECT 
+    co.order_id,
+    c.customer_id,
+    CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+    c.email AS customer_email,
+    co.order_date,
+    co.total_amount,
+    co.order_status,
+    oi.isbn,
+    b.title AS book_title,
+    oi.quantity,
+    oi.unit_price,
+    oi.subtotal,
+    ca.address_line1,
+    ca.city,
+    ca.country
+FROM customer_orders co
+JOIN customers c ON co.customer_id = c.customer_id
+JOIN order_items oi ON co.order_id = oi.order_id
+JOIN books b ON oi.isbn = b.isbn
+LEFT JOIN customer_addresses ca ON co.shipping_address_id = ca.address_id;
+```
+
+USED IN:
+- orders.php (customer order history)
+- Could be used in admin orders
+
+DENORMALIZATION:
+- One row per order item (not per order)
+- Need to group in application layer
+
+---
+VIEW 3: vw_low_stock_books
+---
+PURPOSE: Identify books needing reorder
+COMPLEXITY: Medium
+
+DEFINITION:
+```sql
+CREATE VIEW vw_low_stock_books AS
+SELECT 
+    b.isbn,
+    b.title,
+    GROUP_CONCAT(a.author_name SEPARATOR ', ') AS authors,
+    p.publisher_name,
+    b.quantity_in_stock,
+    b.minimum_threshold,
+    (b.minimum_threshold - b.quantity_in_stock) AS reorder_quantity
+FROM books b
+LEFT JOIN book_authors ba ON b.isbn = ba.isbn
+LEFT JOIN authors a ON ba.author_id = a.author_id
+LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
+WHERE b.quantity_in_stock < b.minimum_threshold
+GROUP BY b.isbn;
+```
+
+USED IN:
+- admin/dashboard.php (alerts)
+- Could be used for automatic ordering
+
+COMPUTED COLUMN: reorder_quantity (calculated)
+
+FILTER: WHERE clause in view (only low stock)
+
+================================================================================
+TRIGGERS DOCUMENTATION
+================================================================================
+
+---
+TRIGGER 1: trg_before_book_update
+---
+EVENT: BEFORE UPDATE on books
+PURPOSE: Prevent negative stock
+TYPE: Validation
+
+DEFINITION:
+```sql
+CREATE TRIGGER trg_before_book_update
+BEFORE UPDATE ON books
+FOR EACH ROW
+BEGIN
+    IF NEW.quantity_in_stock < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Stock cannot be negative';
+    END IF;
+END;
+```
+
+BUSINESS RULE: Stock must be >= 0
+ERROR HANDLING: Throws MySQL error (45000 = user-defined)
+
+WHEN IT FIRES:
+- Any UPDATE on books that would set quantity_in_stock < 0
+- Blocks the update
+- Returns error to PHP
+
+---
+TRIGGER 2: trg_after_book_update_reorder
+---
+EVENT: AFTER UPDATE on books
+PURPOSE: Automatic reorder when stock low
+TYPE: Business automation
+
+DEFINITION:
+```sql
+CREATE TRIGGER trg_after_book_update_reorder
+AFTER UPDATE ON books
+FOR EACH ROW
+BEGIN
+    IF OLD.quantity_in_stock >= OLD.minimum_threshold 
+       AND NEW.quantity_in_stock < NEW.minimum_threshold THEN
+        INSERT INTO publisher_orders (isbn, quantity_ordered, order_status)
+        VALUES (NEW.isbn, 50, 'Pending');
+    END IF;
+END;
+```
+
+BUSINESS RULE: Auto-order 50 units when stock drops below threshold
+
+CONDITION: Crosses threshold (was above, now below)
+- OLD.quantity >= threshold: Was sufficient
+- NEW.quantity < threshold: Now insufficient
+- TRANSITION: Triggers order
+
+CONSTANT: 50 units (hardcoded)
+
+WHEN IT FIRES:
+- Stock updated via checkout
+- Stock manually adjusted by admin
+- Any UPDATE that crosses threshold
+
+---
+TRIGGER 3: trg_before_order_item_insert
+---
+EVENT: BEFORE INSERT on order_items
+PURPOSE: Calculate subtotal
+TYPE: Data enrichment
+
+DEFINITION:
+```sql
+CREATE TRIGGER trg_before_order_item_insert
+BEFORE INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    IF NEW.subtotal IS NULL THEN
+        SET NEW.subtotal = NEW.quantity * NEW.unit_price;
+    END IF;
+END;
+```
+
+BUSINESS RULE: Subtotal = quantity × unit_price
+
+IDEMPOTENT: Only calculates if NULL
+- Allows manual override
+- Provides default calculation
+
+WHEN IT FIRES:
+- checkout.php inserts order items
+- Automatically calculates money
+
+---
+TRIGGER 4: trg_after_order_item_insert
+---
+EVENT: AFTER INSERT on order_items
+PURPOSE: Decrement stock after sale
+TYPE: Inventory management
+
+DEFINITION:
+```sql
+CREATE TRIGGER trg_after_order_item_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    UPDATE books 
+    SET quantity_in_stock = quantity_in_stock - NEW.quantity
+    WHERE isbn = NEW.isbn;
+END;
+```
+
+BUSINESS RULE: Stock decreases when sold
+
+AUTOMATIC: No PHP code needed to update stock
+
+CHAIN REACTION:
+1. Order item inserted
+2. This trigger decrements stock
+3. If stock crosses threshold, trigger 2 fires
+4. Publisher order created
+
+DEMONSTRATES: Trigger chaining
+
+---
+TRIGGER 5: trg_after_publisher_order_confirm
+---
+EVENT: AFTER UPDATE on publisher_orders
+PURPOSE: Add stock when order confirmed
+TYPE: Inventory management
+
+DEFINITION:
+```sql
+CREATE TRIGGER trg_after_publisher_order_confirm
+AFTER UPDATE ON publisher_orders
+FOR EACH ROW
+BEGIN
+    IF OLD.order_status = 'Pending' AND NEW.order_status = 'Confirmed' THEN
+        UPDATE books 
+        SET quantity_in_stock = quantity_in_stock + NEW.quantity_ordered
+        WHERE isbn = NEW.isbn;
+    END IF;
+END;
+```
+
+BUSINESS RULE: Stock increases when replenishment arrives
+
+CONDITION: Status changes from Pending to Confirmed
+
+AUTOMATIC: Admin just changes status, stock updates
+
+BIDIRECTIONAL:
+- Trigger 4: Decreases stock (sales)
+- Trigger 5: Increases stock (replenishment)
+
+================================================================================
+STORED PROCEDURES DOCUMENTATION
+================================================================================
+
+All procedures return result sets (not OUT parameters)
+Called via: CALL procedure_name(parameters)
+
+---
+PROCEDURE 1: get_sales_previous_month()
+---
+PURPOSE: Monthly sales summary
+PARAMETERS: None (uses current date)
+
+RETURNS:
+- sale_date (DATE)
+- total_orders (INT)
+- total_sales (DECIMAL)
+
+GROUPED BY: Date
+TIMEFRAME: Last month from today
+
+---
+PROCEDURE 2: get_sales_for_date(p_date DATE)
+---
+PURPOSE: Sales breakdown for specific date
+PARAMETERS:
+- p_date: DATE (format: 'YYYY-MM-DD')
+
+RETURNS:
+- title (VARCHAR)
+- copies_sold (INT)
+- total_revenue (DECIMAL)
+
+GROUPED BY: Book
+ORDERED BY: Revenue descending
+
+---
+PROCEDURE 3: get_top_customers(p_months INT)
+---
+PURPOSE: Identify best customers
+PARAMETERS:
+- p_months: INT (lookback period)
+
+RETURNS:
+- customer_id (INT)
+- customer_name (VARCHAR)
+- email (VARCHAR)
+- total_orders (INT)
+- total_spent (DECIMAL)
+
+GROUPED BY: Customer
+ORDERED BY: Total spent descending
+LIMIT: 5
+
+---
+PROCEDURE 4: get_top_selling_books(p_months INT)
+---
+PURPOSE: Identify bestsellers
+PARAMETERS:
+- p_months: INT (lookback period)
+
+RETURNS:
+- isbn (VARCHAR)
+- title (VARCHAR)
+- authors (TEXT - concatenated)
+- copies_sold (INT)
+- total_revenue (DECIMAL)
+
+GROUPED BY: Book
+ORDERED BY: Copies sold descending
+LIMIT: 10
+
+---
+PROCEDURE 5: get_book_order_count(p_isbn VARCHAR(13))
+---
+PURPOSE: Track publisher order frequency
+PARAMETERS:
+- p_isbn: VARCHAR(13)
+
+RETURNS:
+- isbn (VARCHAR)
+- title (VARCHAR)
+- times_ordered (INT)
+- total_quantity_ordered (INT)
+
+SINGLE ROW: One book's statistics
+
+================================================================================
+TRANSACTION PATTERNS
+================================================================================
+
+---
+PATTERN 1: Simple Transaction (register.php)
+---
+PURPOSE: Atomic multi-table insert
+STEPS:
+1. BEGIN TRANSACTION
+2. INSERT customer
+3. INSERT phone
+4. INSERT address
+5. INSERT cart
+6. COMMIT (or ROLLBACK on error)
+
+GUARANTEE: All or nothing
+
+---
+PATTERN 2: Locking Transaction (checkout.php)
+---
+PURPOSE: Prevent race conditions in inventory
+STEPS:
+1. BEGIN TRANSACTION
+2. SELECT ... FOR UPDATE (lock rows)
+3. Validate stock
+4. INSERT order
+5. INSERT order items (triggers fire)
+6. DELETE cart items
+7. COMMIT
+
+CRITICAL: FOR UPDATE prevents concurrent orders on same book
+
+---
+PATTERN 3: Nested Transaction Simulation (admin/books.php)
+---
+PURPOSE: Complex multi-table updates
+STEPS:
+1. BEGIN TRANSACTION
+2. INSERT book
+3. LOOP:
+   - SELECT author (check exists)
+   - INSERT author (if new)
+   - INSERT book_author (link)
+4. COMMIT
+
+SAVEPOINT: Could use SAVEPOINT for partial rollback
+
+================================================================================
+QUERY OPTIMIZATION PATTERNS
+================================================================================
+
+---
+PATTERN 1: Prepared Statements
+---
+USED EVERYWHERE:
+```php
+$stmt = $conn->prepare("SELECT * FROM books WHERE isbn = ?");
+$stmt->bind_param("s", $isbn);
+$stmt->execute();
+```
+
+BENEFITS:
+- SQL injection prevention
+- Query plan caching
+- Type safety
+
+---
+PATTERN 2: GROUP_CONCAT for 1:N relationships
+---
+USED IN: Authors per book
+```sql
+GROUP_CONCAT(a.author_name SEPARATOR ', ')
+```
+
+ALTERNATIVE: JSON_ARRAYAGG (MySQL 5.7.22+)
+```sql
+JSON_ARRAYAGG(a.author_name)
+```
+
+BENEFIT: Single query instead of N+1
+
+---
+PATTERN 3: Indexing Strategy
+---
+INDEXED COLUMNS:
+- Primary keys (automatic)
+- Foreign keys (manual)
+- Search columns (title, category)
+- Join columns (isbn, customer_id)
+
+NOT INDEXED:
+- Text fields (description)
+- Low cardinality (category - only 5 values)
+
+---
+PATTERN 4: View Materialization
+---
+USED IN: vw_books_full_details
+
+BENEFIT: Pre-computed joins
+TRADE-OFF: Not real-time (refresh on query)
+
+ALTERNATIVE: Materialized view (not in MySQL)
+
+================================================================================
+SECURITY PATTERNS
+================================================================================
+
+---
+PATTERN 1: Ownership Validation
+---
+EVERYWHERE:
+```sql
+WHERE ... AND customer_id = ?
+```
+
+PREVENTS: Unauthorized access to other users' data
+
+EXAMPLE:
+```sql
+DELETE FROM payment_methods 
+WHERE payment_id = ? AND customer_id = ?
+```
+- Can't delete someone else's payment method
+
+---
+PATTERN 2: Password Handling
+---
+REGISTRATION:
+```php
+$password_hash = password_hash($password, PASSWORD_DEFAULT);
+```
+
+LOGIN:
+```php
+password_verify($password, $stored_hash)
+```
+
+NEVER: Store plain text passwords
+
+---
+PATTERN 3: SQL Injection Prevention
+---
+ALL QUERIES: Use prepared statements
+```php
+$stmt = $conn->prepare("SELECT * FROM books WHERE title LIKE ?");
+$search = "%$term%";
+$stmt->bind_param("s", $search);
+```
+
+NEVER:
+```php
+$query = "SELECT * FROM books WHERE title LIKE '%$term%'"; // VULNERABLE
+```
+
+---
+PATTERN 4: XSS Prevention
+---
+ALL OUTPUT:
+```php
+<?php echo htmlspecialchars($data); ?>
+```
+
+ENCODES: <, >, &, ", '
+PREVENTS: Script injection
+
+---
+PATTERN 5: CSRF Prevention
+---
+USED: Session-based authentication
+```php
+if (!isset($_SESSION['customer_id'])) {
+    header('Location: login.php');
+    exit;
+}
+```
+
+SHOULD ADD: CSRF tokens for forms
+
+================================================================================
+PERFORMANCE CONSIDERATIONS
+================================================================================
+
+---
+BOTTLENECKS:
+---
+1. N+1 QUERY PROBLEM
+   - orders.php: Loops through orders to get items
+   - SOLUTION: Single query with JSON_ARRAYAGG
+
+2. NO PAGINATION
+   - index.php: Loads all books
+   - SOLUTION: Add LIMIT and OFFSET
+
+3. NO QUERY CACHING
+   - Repeated queries (e.g., cart count)
+   - SOLUTION: Cache in session
+
+4. FULL TABLE SCANS
+   - Searches without indexes
+   - SOLUTION: Add FULLTEXT indexes
+
+---
+OPTIMIZATIONS PRESENT:
+---
+1. Prepared statements (query plan caching)
+2. Views (pre-computed joins)
+3. Triggers (move logic to database)
+4. Stored procedures (pre-compiled)
+5. Proper indexes on foreign keys
+
+---
+SCALABILITY LIMITS:
+---
+1. Single database server (no replication)
+2. No caching layer (Redis/Memcached)
+3. No CDN for images
+4. Synchronous processing (no queues)
+
+GOOD FOR: <10,000 products, <1,000 concurrent users
+
+================================================================================
+SUMMARY OF QUERY COUNTS BY FILE
+================================================================================
+
+CUSTOMER PAGES:
+- index.php: 2 queries
+- login.php: 2 queries
+- register.php: 5 queries (transaction)
+- cart.php: 3 queries
+- checkout.php: 12+ queries (transaction, loops)
+- orders.php: 2 + N queries (N = number of orders)
+- logout.php: 2 queries
+- profile.php: 5 reads + 2-4 per action
+
+API:
+- api/cart.php: 3-6 queries per action
+
+ADMIN PAGES:
+- admin/login.php: 2 queries
+- admin/dashboard.php: 9 queries
+- admin/books.php: 3 reads + 4-10 per action (transaction)
+- admin/orders.php: 3 reads + 1 per action
+- admin/reports.php: 1 stored procedure per report
+
+TOTAL QUERIES IN CODEBASE: ~80 unique SQL statements
+
+================================================================================
+KEY TECHNICAL INSIGHTS FOR DISCUSSION
+================================================================================
+
+1. NORMALIZATION (3NF)
+   - Multi-valued attributes (phones, addresses) in separate tables
+   - Authors table eliminates redundancy
+   - Junction tables for many-to-many (book_authors)
+
+2. TRANSACTION MANAGEMENT
+   - Checkout uses FOR UPDATE for locking
+   - Registration uses atomic transactions
+   - Rollback on any failure
+
+3. TRIGGER AUTOMATION
+   - Stock updates automatic on order
+   - Auto-reorder when low stock
+   - Subtotal calculation automatic
+
+4. VIEW ABSTRACTION
+   - Complex joins hidden behind views
+   - Consistent data access patterns
+   - Performance vs maintainability trade-off
+
+5. STORED PROCEDURE BENEFITS
+   - Business logic in database
+   - Pre-compiled for performance
+   - Consistent across applications
+
+6. SECURITY LAYERS
+   - Prepared statements (SQL injection)
+   - Password hashing (bcrypt)
+   - Session management
+   - Ownership validation
+
+7. BUSINESS LOGIC ENFORCEMENT
+   - Triggers enforce rules
+   - CHECK constraints validate data
+   - Foreign keys ensure integrity
+
+8. SEPARATION OF CONCERNS
+   - cart.php (view) vs api/cart.php (controller)
+   - Database logic vs application logic
+   - Clean architecture
+
+================================================================================
+END OF TECHNICAL DOCUMENTATION
+================================================================================
